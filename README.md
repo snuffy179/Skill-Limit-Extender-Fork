@@ -53,7 +53,23 @@ Legacy `SLE_Skill_List.yaml` files are ignored by this fork.
 
 # Default behavior
 
-The default configuration is deliberately very different from vanilla. Skills can level to **1000**, while their normal skill-effect factor stops increasing at **500** unless `BonusCap` is changed.
+The default configuration stays fairly close to vanilla for skill levels 0–100, while extending progression far beyond the vanilla cap.
+
+Skills can level up to 1000, while their normal skill-effect factor stops increasing at 500 by default unless BonusCap is changed.
+
+The default experience curve is designed so that:
+
+- Levels 0–10 are slightly slower than vanilla.
+- Levels 11–60 are slightly easier than vanilla.
+- Levels 61–90 are close to vanilla progression.
+- Levels 91–100 become somewhat harder than vanilla.
+- Levels 101+ become progressively much harder to achieve.
+
+This keeps the early and mid-game progression familiar while making very high skill levels a long-term goal rather than something reached quickly.
+
+As for the effect of each skill level, levels 0–100 behave the same as vanilla. Starting from level 101, the additional effect becomes progressively weaker as the skill increases.
+
+This prevents effects such as stamina, eitr, or health-cost reductions from ever reaching 100% reduction or going beyond it into negative values, which would otherwise cause unintended behavior such as restoring stamina instead of consuming it.
 
 ## Default skill settings
 
