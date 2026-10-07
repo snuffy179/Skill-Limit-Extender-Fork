@@ -2,14 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Reflection.Emit;
 using HarmonyLib;
-using UnityEngine;
 
 namespace SkillLimitExtender
 {
     /// <summary>
-    /// Keeps vanilla SkillsDialog.Setup intact, but sanitizes invalid skill data
-    /// before the dialog is built and corrects presentation for raw levels above
-    /// the vanilla 100-level UI assumptions.
+    /// Keeps vanilla SkillsDialog.Setup intact, sanitizes invalid skill data
+    /// before the dialog is built, and replaces the vanilla level-100 UI
+    /// denominator with SLE's configured denominator.
     /// </summary>
     [HarmonyPatch(typeof(global::SkillsDialog), nameof(global::SkillsDialog.Setup))]
     internal static class SLE_Hook_SkillsDialog_LevelBars
@@ -56,124 +55,6 @@ namespace SkillLimitExtender
                     $"[SLE] SkillsDialog.Setup preflight failed: {ex}");
                 return false;
             }
-        }
-
-        /// <summary>
-        /// Valheim 1.0 has a separate blue skill-bonus display. Its vanilla UI
-        /// assumes stored levels never exceed 100 and can misinterpret an extended
-        /// raw level as a bonus. After vanilla successfully builds the rows, write
-        /// the actual stored level and bars back into the row.
-        ///
-        /// We preserve a genuine positive effective-level bonus when the game's
-        /// GetSkillLevel result is greater than the raw stored level. If vanilla
-        /// clamps the effective result below an extended raw level, it is not shown
-        /// as a fake blue bonus.
-        /// </summary>
-        [HarmonyPostfix]
-        [HarmonyPriority(-9000)]
-        private static void Postfix(global::SkillsDialog __instance, Player player)
-        {
-            try
-            {
-                if (__instance == null || player == null || __instance.m_elements == null)
-                    return;
-
-                var skills = player.GetSkills();
-                if (skills == null)
-                    return;
-
-                var skillList = skills.GetSkillList();
-                if (skillList == null)
-                    return;
-
-                int count = Math.Min(skillList.Count, __instance.m_elements.Count);
-
-                for (int i = 0; i < count; i++)
-                {
-                    var skill = skillList[i];
-                    var row = __instance.m_elements[i];
-
-                    if (skill == null || skill.m_info == null || row == null)
-                        continue;
-
-                    var skillType = skill.m_info.m_skill;
-                    if (skillType == global::Skills.SkillType.None ||
-                        skillType == global::Skills.SkillType.All)
-                        continue;
-
-                    float rawLevel = skill.m_level;
-                    float cap = Math.Max(1f, SkillConfigManager.GetCap(skillType));
-
-                    // Vanilla's raw level text is correct below 100. Above 100,
-                    // explicitly overwrite it so the UI does not show e.g. 100+100.
-                    if (rawLevel > 100f)
-                    {
-                        SetChildText(row, "leveltext", Mathf.FloorToInt(rawLevel).ToString());
-
-                        float effectiveLevel;
-                        try
-                        {
-                            effectiveLevel = skills.GetSkillLevel(skillType);
-                        }
-                        catch
-                        {
-                            effectiveLevel = rawLevel;
-                        }
-
-                        float realBonus = Mathf.Max(0f, effectiveLevel - rawLevel);
-                        SetChildText(
-                            row,
-                            "bonustext",
-                            realBonus >= 1f ? $"+{Mathf.FloorToInt(realBonus)}" : string.Empty);
-
-                        // Keep the yellow/base and blue/total bars meaningful for
-                        // extended caps. If vanilla clamps GetSkillLevel below the raw
-                        // level, the total bar is never allowed to shrink below base.
-                        SetChildBar(row, "currentlevel", Mathf.Clamp01(rawLevel / cap));
-                        SetChildBar(row, "levelbar_total", Mathf.Clamp01(Mathf.Max(rawLevel, effectiveLevel) / cap));
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogWarning(
-                    $"[SLE] SkillsDialog extended-level presentation fix failed: {ex.Message}");
-            }
-        }
-
-        private static void SetChildText(GameObject row, string childName, string value)
-        {
-            var child = Utils.FindChild(row.transform, childName, (IterativeSearchType)0);
-            if (child == null)
-                return;
-
-            // Avoid a hard compile-time dependency on Unity.TextMeshPro.dll.
-            var components = child.GetComponents<Component>();
-            for (int i = 0; i < components.Length; i++)
-            {
-                var component = components[i];
-                if (component == null)
-                    continue;
-
-                var type = component.GetType();
-                var property = AccessTools.Property(type, "text");
-                if (property == null || !property.CanWrite || property.PropertyType != typeof(string))
-                    continue;
-
-                property.SetValue(component, value, null);
-                return;
-            }
-        }
-
-        private static void SetChildBar(GameObject row, string childName, float value)
-        {
-            var child = Utils.FindChild(row.transform, childName, (IterativeSearchType)0);
-            if (child == null)
-                return;
-
-            var bar = child.GetComponent<GuiBar>();
-            if (bar != null)
-                bar.SetValue(value);
         }
 
         [HarmonyTranspiler]

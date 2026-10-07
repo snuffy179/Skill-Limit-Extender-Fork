@@ -16,7 +16,7 @@ This fork is intended as a **replacement** for the original SkillLimitExtender 1
 - Extended Run, Swim, Dodge, Sneak stamina, Fishing, and Riding cost scaling.
 - Optional Jump-based safe-fall-distance scaling.
 - Automatic configuration sections for vanilla skills and discovered mod skills.
-- Skill UI support for raw levels above 100.
+- Skill UI support for extended caps, plus invalid-entry sanitization.
 - Character skill-data sanitization to prevent invalid skill entries from breaking the skills UI or save data.
 - Server configuration synchronization and version/protocol checks.
 - Normal BepInEx `.cfg` configuration only — **Jotunn and YamlDotNet are not required**.
