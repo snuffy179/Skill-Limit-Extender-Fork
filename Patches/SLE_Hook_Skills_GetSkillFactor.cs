@@ -14,10 +14,16 @@ namespace SkillLimitExtender
         {
             try
             {
+                if (SLE_SkillFactorOverride.TryGet(skillType, out float overrideFactor))
+                {
+                    __result = overrideFactor;
+                    return false;
+                }
+
                 var skill = SLE_SkillsExtensions.GetSkillSafe(__instance, skillType);
                 float level = skill != null ? skill.m_level : 0f;
 
-                // Read settings (YAML-based)
+                // Read per-skill settings from the BepInEx config
                 int bonusCap = System.Math.Max(1, SkillConfigManager.GetBonusCap(skillType));
                 float maxFactor = bonusCap / 100f;
 

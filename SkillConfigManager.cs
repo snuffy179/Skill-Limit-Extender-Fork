@@ -1,673 +1,604 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using BepInEx.Configuration;
 
 namespace SkillLimitExtender
 {
     /// <summary>
-    /// Lightweight server configuration manager (cap/bonus managed via YAML).
-    /// Server syncs full YAML; clients consume it.
+    /// Per-skill configuration stored directly in the normal BepInEx config.
+    /// Vanilla skills are exposed as simple sections such as [Swords], [Bows],
+    /// [Jump], etc. Server-locked values are distributed as a small internal
+    /// snapshot; no external serialization library is required.
     /// </summary>
     internal static class SkillConfigManager
     {
-        // Keep only toggle settings (caps/bonus managed via YAML)
-        internal static ConfigEntry<bool> ServerConfigLocked = null!;
-        internal static ConfigEntry<bool> EnableYamlOverride = null!;
+        private sealed class SkillSettings
+        {
+            internal readonly string Section;
+            internal readonly ConfigEntry<int> Cap;
+            internal readonly ConfigEntry<int> BonusCap;
+            internal readonly ConfigEntry<bool> Relative;
+            internal readonly ConfigEntry<bool> UseCustomGrowthCurve;
+            internal readonly ConfigEntry<float> GrowthExponent;
+            internal readonly ConfigEntry<float> GrowthMultiplier;
+            internal readonly ConfigEntry<float> GrowthConstant;
 
-        // Internal state (YAML map)
-        private static Dictionary<string, YamlExporter.SkillYamlEntry> _entriesByName = new(StringComparer.Ordinal);
-        private static bool _initialized;
+            internal SkillSettings(ConfigFile config, string section)
+            {
+                Section = section;
+
+                Cap = config.Bind(
+                    section,
+                    "Cap",
+                    DefaultCapFallback,
+                    "Maximum level this skill can reach. Formula: finalLevel <= Cap.");
+
+                BonusCap = config.Bind(
+                    section,
+                    "BonusCap",
+                    DefaultBonusCapFallback,
+                    "Maximum skill-effect factor expressed as a level-like percentage. " +
+                    "100 = factor 1.0, 250 = factor 2.5, 500 = factor 5.0. " +
+                    "Formula: maxSkillFactor = BonusCap / 100.");
+
+                Relative = config.Bind(
+                    section,
+                    "Relative",
+                    false,
+                    "Controls how the skill-effect factor is calculated. " +
+                    "true: the configured Cap becomes the point where BonusCap is reached. " +
+                    "false: every 100 skill levels add 1.0 factor until BonusCap is reached. " +
+                    "Formula (true): factor = (level / Cap) * (BonusCap / 100). " +
+                    "Formula (false): factor = level / 100. Both modes clamp to BonusCap / 100.");
+
+                UseCustomGrowthCurve = config.Bind(
+                    section,
+                    "UseCustomGrowthCurve",
+                    true,
+                    "Use the custom XP requirement formula below instead of vanilla XP progression.");
+
+                GrowthExponent = config.Bind(
+                    section,
+                    "GrowthExponent",
+                    2.1f,
+                    "Exponent used only for XP required to gain the next level. Vanilla = 1.5. " +
+                    "Final formula: XP = nextLevel^GrowthExponent * GrowthMultiplier + GrowthConstant.");
+
+                GrowthMultiplier = config.Bind(
+                    section,
+                    "GrowthMultiplier",
+                    0.04f,
+                    "Multiplier used only for XP required to gain the next level. Vanilla = 0.5. " +
+                    "Final formula: XP = nextLevel^GrowthExponent * GrowthMultiplier + GrowthConstant.");
+
+                GrowthConstant = config.Bind(
+                    section,
+                    "GrowthConstant",
+                    8.0f,
+                    "Constant added only to XP required to gain the next level. Vanilla = 0.5. " +
+                    "Final formula: XP = nextLevel^GrowthExponent * GrowthMultiplier + GrowthConstant.");
+
+            }
+        }
+
+        private sealed class SkillValues
+        {
+            internal int Cap;
+            internal int BonusCap;
+            internal bool Relative;
+            internal bool UseCustomGrowthCurve;
+            internal float GrowthExponent;
+            internal float GrowthMultiplier;
+            internal float GrowthConstant;
+        }
+
+        internal static ConfigEntry<bool> ServerConfigLocked { get; private set; } = null!;
+
+        internal const int DefaultCapFallback = 1000;
+        internal const int DefaultBonusCapFallback = 500;
+
+        private static readonly Dictionary<string, SkillSettings> EntriesByName =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly Dictionary<int, string> SkillKeysById = new();
+
+        private static Dictionary<string, SkillValues> _serverEntries =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        private static readonly HashSet<int> WarnedSkillIds = new();
+
+        private static ConfigFile _config = null!;
+        private static bool _serverInitialized;
+        private static bool _skillsInitialized;
         private static bool _isServerConfig;
-        private static string _lastYamlHash = string.Empty;
-        
-        // Track warned skill IDs to prevent duplicate warnings
-        private static HashSet<int> _warnedSkillIds = new HashSet<int>();
+        private static string _lastSnapshotHash = string.Empty;
 
-        // Fallback defaults when YAML is not set
-        internal const int DefaultCapFallback = 250;
-        internal const int DefaultBonusCapFallback = 100; // 100 = 1.0x
+        internal static void InitializeServer(ConfigFile config)
+        {
+            if (_serverInitialized)
+                return;
+
+            _config = config;
+
+            ServerConfigLocked = config.Bind(
+                "2 - Server",
+                "LockConfiguration",
+                false,
+                new ConfigDescription(
+                    "If true, the server sends its Skill Limit Extender gameplay configuration to clients.",
+                    null,
+                    new object[]
+                    {
+                        new ConfigurationManagerAttributes
+                        {
+                            Category = "2 - Server",
+                            Order = -1000,
+                            IsAdminOnly = true
+                        }
+                    }));
+
+            _serverInitialized = true;
+        }
+
+        internal static void InitializeSkills()
+        {
+            if (_skillsInitialized)
+                return;
+
+            if (!_serverInitialized)
+                throw new InvalidOperationException("SkillConfigManager.InitializeServer must be called before InitializeSkills.");
+
+            BindVanillaSkills();
+            _skillsInitialized = true;
+
+            SkillLimitExtenderPlugin.Logger?.LogInfo(
+                $"[SLE] BepInEx skill configuration initialized ({EntriesByName.Count} skill sections)");
+        }
 
         internal static void Initialize(ConfigFile config)
         {
-            if (_initialized) return;
-
-            // Server-only settings (admin only)
-            ServerConfigLocked = config.Bind("Server", "LockConfiguration", false,
-                new ConfigDescription(
-                    "If true, server forces its configuration to all clients. (Admin Only)",
-                    null,
-                    new object[] { new ConfigurationManagerAttributes { Category = "Server", Order = -1000, IsAdminOnly = true } }
-                )
-            );
-
-            EnableYamlOverride = config.Bind("General", "EnableYamlOverride", true,
-                new ConfigDescription(
-                    "Allow YAML file to override individual skill caps/bonus/relative",
-                    null,
-                    new object[] { new ConfigurationManagerAttributes { Category = "Skill Level", Order = -85 } }
-                )
-            );
-
-            ReloadFromYaml();
-            _initialized = true;
-            SkillLimitExtenderPlugin.Logger?.LogInfo("[SLE] Lightweight server config initialized (YAML-based)");
+            InitializeServer(config);
+            InitializeSkills();
         }
 
-        // Receive YAML distributed by server (via RPC)
-        internal static void OnYamlReceivedStatic(long sender, string yamlContent, int protocolVersion)
+        private static void BindVanillaSkills()
         {
-            OnYamlReceived(sender, yamlContent, protocolVersion);
-        }
-
-        internal static void ReloadFromYaml()
-        {
-            // Ignore local YAML if server configuration is locked
-            if (_isServerConfig || (EnableYamlOverride != null && !EnableYamlOverride.Value))
+            foreach (global::Skills.SkillType skillType in Enum.GetValues(typeof(global::Skills.SkillType)))
             {
-                if (_isServerConfig)
+                if (skillType == global::Skills.SkillType.None ||
+                    skillType == global::Skills.SkillType.All)
                 {
-                    SkillLimitExtenderPlugin.Logger?.LogInfo("[SLE] Using server configuration (YAML disabled locally)");
+                    continue;
                 }
+
+                string name = skillType.ToString();
+                if (int.TryParse(name, out _))
+                    continue;
+
+                BindSkill(name);
+                SkillKeysById[(int)skillType] = name;
+            }
+        }
+
+        private static SkillSettings BindSkill(string section)
+        {
+            section = NormalizeSectionName(section);
+
+            if (EntriesByName.TryGetValue(section, out SkillSettings existing))
+                return existing;
+
+            var created = new SkillSettings(_config, section);
+            EntriesByName[section] = created;
+            return created;
+        }
+
+        private static SkillSettings GetSettings(global::Skills.SkillType skillType)
+        {
+            string key = GetSkillKeyForLookup(skillType);
+            return BindSkill(key);
+        }
+
+        private static string GetSkillKeyForLookup(global::Skills.SkillType skillType)
+        {
+            int skillId = (int)skillType;
+
+            if (SkillKeysById.TryGetValue(skillId, out string cached))
+                return cached;
+
+            string enumName = skillType.ToString();
+            if (!int.TryParse(enumName, out _))
+            {
+                SkillKeysById[skillId] = enumName;
+                return enumName;
+            }
+
+            string actualName = GetActualModSkillName(skillType);
+            string section = NormalizeSectionName(actualName);
+
+            if (string.IsNullOrWhiteSpace(section) || int.TryParse(section, out _))
+                section = enumName;
+
+            SkillKeysById[skillId] = section;
+
+            if (!EntriesByName.ContainsKey(section) && WarnedSkillIds.Add(skillId))
+            {
+                SkillLimitExtenderPlugin.Logger?.LogInfo(
+                    $"[SLE] Discovered MOD skill {skillId}; using config section [{section}]");
+            }
+
+            return section;
+        }
+
+        private static string GetActualModSkillName(global::Skills.SkillType skillType)
+        {
+            try
+            {
+                var player = SLE_SkillHelpers.GetSafeLocalPlayer();
+                var skills = player?.GetSkills();
+                if (skills == null)
+                    return skillType.ToString();
+
+                var skillData = HarmonyLib.Traverse.Create(skills)
+                    .Field("m_skillData")
+                    .GetValue<Dictionary<global::Skills.SkillType, global::Skills.Skill>>();
+
+                if (skillData == null || !skillData.TryGetValue(skillType, out var skill) || skill == null)
+                    return skillType.ToString();
+
+                var info = HarmonyLib.Traverse.Create(skill)
+                    .Field("m_info")
+                    .GetValue<global::Skills.SkillDef>();
+
+                if (info == null)
+                    return skillType.ToString();
+
+                string description = HarmonyLib.Traverse.Create(info)
+                    .Field("m_description")
+                    .GetValue<string>();
+
+                if (!string.IsNullOrWhiteSpace(description))
+                {
+                    if (description.StartsWith("$"))
+                    {
+                        string localized = Localization.instance?.Localize(description);
+                        if (!string.IsNullOrWhiteSpace(localized) && localized != description)
+                            return localized;
+                    }
+                    else
+                    {
+                        return description;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
+                    SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] MOD skill name lookup failed: {ex.Message}");
+            }
+
+            return skillType.ToString();
+        }
+
+        private static string NormalizeSectionName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return "UnknownSkill";
+
+            var builder = new StringBuilder(name.Length);
+            foreach (char c in name)
+            {
+                if (char.IsLetterOrDigit(c) || c == '_' || c == '-')
+                    builder.Append(c);
+            }
+
+            return builder.Length > 0 ? builder.ToString() : "UnknownSkill";
+        }
+
+        private static bool TryGetServerValues(string section, out SkillValues values)
+        {
+            values = null!;
+            return _isServerConfig && _serverEntries.TryGetValue(section, out values!);
+        }
+
+        internal static int GetCap(global::Skills.SkillType skillType)
+        {
+            SkillSettings entry = GetSettings(skillType);
+            if (TryGetServerValues(entry.Section, out var server) && server.Cap > 0)
+                return server.Cap;
+            return entry.Cap.Value > 0 ? entry.Cap.Value : DefaultCapFallback;
+        }
+
+        internal static int GetBonusCap(global::Skills.SkillType skillType)
+        {
+            SkillSettings entry = GetSettings(skillType);
+            if (TryGetServerValues(entry.Section, out var server) && server.BonusCap > 0)
+                return server.BonusCap;
+            return entry.BonusCap.Value > 0 ? entry.BonusCap.Value : DefaultBonusCapFallback;
+        }
+
+        internal static bool IsRelative(global::Skills.SkillType skillType)
+        {
+            SkillSettings entry = GetSettings(skillType);
+            return TryGetServerValues(entry.Section, out var server)
+                ? server.Relative
+                : entry.Relative.Value;
+        }
+
+        internal static bool UseCustomGrowthCurve(global::Skills.SkillType skillType)
+        {
+            SkillSettings entry = GetSettings(skillType);
+            return TryGetServerValues(entry.Section, out var server)
+                ? server.UseCustomGrowthCurve
+                : entry.UseCustomGrowthCurve.Value;
+        }
+
+        internal static float GetGrowthExponent(global::Skills.SkillType skillType)
+        {
+            SkillSettings entry = GetSettings(skillType);
+            return TryGetServerValues(entry.Section, out var server)
+                ? server.GrowthExponent
+                : entry.GrowthExponent.Value;
+        }
+
+        internal static float GetGrowthMultiplier(global::Skills.SkillType skillType)
+        {
+            SkillSettings entry = GetSettings(skillType);
+            return TryGetServerValues(entry.Section, out var server)
+                ? server.GrowthMultiplier
+                : entry.GrowthMultiplier.Value;
+        }
+
+        internal static float GetGrowthConstant(global::Skills.SkillType skillType)
+        {
+            SkillSettings entry = GetSettings(skillType);
+            return TryGetServerValues(entry.Section, out var server)
+                ? server.GrowthConstant
+                : entry.GrowthConstant.Value;
+        }
+
+        internal static int GetCartographySkillCap()
+        {
+            foreach (string key in new[] { "Cartography", "CartographySkill", "1337" })
+            {
+                if (_isServerConfig && _serverEntries.TryGetValue(key, out var server) && server.Cap > 0)
+                    return server.Cap;
+
+                if (EntriesByName.TryGetValue(key, out var local) && local.Cap.Value > 0)
+                    return local.Cap.Value;
+            }
+
+            return DefaultCapFallback;
+        }
+
+        internal static bool IsConfiguredSkill(global::Skills.SkillType skillType)
+        {
+            string key = GetSkillKeyForLookup(skillType);
+            return EntriesByName.ContainsKey(key) || _serverEntries.ContainsKey(key);
+        }
+
+        internal static int GetCapByName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                return DefaultCapFallback;
+
+            if (Enum.TryParse(name, true, out global::Skills.SkillType skillType) &&
+                skillType != global::Skills.SkillType.None &&
+                skillType != global::Skills.SkillType.All)
+            {
+                return GetCap(skillType);
+            }
+
+            string section = NormalizeSectionName(name);
+            if (_isServerConfig && _serverEntries.TryGetValue(section, out var server) && server.Cap > 0)
+                return server.Cap;
+            if (EntriesByName.TryGetValue(section, out var local) && local.Cap.Value > 0)
+                return local.Cap.Value;
+
+            return DefaultCapFallback;
+        }
+
+        internal static int GetSkillLimit(global::Skills.SkillType skillType) => GetCap(skillType);
+        internal static float GetFactorDenominator(global::Skills.SkillType skillType) => 100f;
+        internal static float GetUiDenominator() => Math.Max(1, DefaultCapFallback);
+        internal static float GetUiDenominatorForSkill(global::Skills.SkillType skillType) => Math.Max(1, GetCap(skillType));
+
+        internal static float GetUiDenominatorForSkillSafe(object? skillMaybe)
+        {
+            try
+            {
+                if (skillMaybe is global::Skills.Skill skill &&
+                    SLE_SkillHelpers.TryGetSkillType(skill, out var skillType))
+                {
+                    return GetUiDenominatorForSkill(skillType);
+                }
+            }
+            catch (Exception ex)
+            {
+                SkillLimitExtenderPlugin.Logger?.LogWarning(
+                    $"[SLE] GetUiDenominatorForSkillSafe failed: {ex.Message}");
+            }
+
+            return GetUiDenominator();
+        }
+
+        internal static void ReloadFromConfig()
+        {
+            try
+            {
+                _config.Reload();
+                SkillLimitExtenderPlugin.Logger?.LogInfo("[SLE] BepInEx configuration reloaded");
+            }
+            catch (Exception ex)
+            {
+                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Config reload failed: {ex}");
+            }
+        }
+
+        internal static string GetConfigPath() => _config.ConfigFilePath;
+
+        internal static void OnConfigReceivedStatic(long sender, string snapshot, int protocolVersion)
+        {
+            if (ZNet.instance?.IsServer() == true)
+                return;
+
+            if (!VersionInfo.IsCompatible(protocolVersion))
+            {
+                SkillLimitExtenderPlugin.Logger?.LogWarning(
+                    $"[SLE] Config protocol mismatch: remote={protocolVersion}, local={VersionInfo.ProtocolVersion}");
                 return;
             }
 
             try
             {
-                var newEntries = YamlExporter.LoadYamlEntries();
-                if (newEntries != null)
+                var parsed = new Dictionary<string, SkillValues>(StringComparer.OrdinalIgnoreCase);
+                string extendedRecord = string.Empty;
+
+                foreach (string rawLine in (snapshot ?? string.Empty).Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries))
                 {
-                    _entriesByName = newEntries;
-                    SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] YAML reloaded successfully ({_entriesByName.Count} entries)");
+                    string line = rawLine.TrimEnd('\r');
+                    string[] parts = line.Split('|');
+                    if (parts.Length == 0)
+                        continue;
+
+                    if (parts[0] == "S" && parts.Length == 9)
+                    {
+                        string section = Decode(parts[1]);
+                        parsed[section] = new SkillValues
+                        {
+                            Cap = ParseInt(parts[2], DefaultCapFallback),
+                            BonusCap = ParseInt(parts[3], DefaultBonusCapFallback),
+                            Relative = ParseBool(parts[4], false),
+                            UseCustomGrowthCurve = ParseBool(parts[5], true),
+                            GrowthExponent = ParseFloat(parts[6], 2.1f),
+                            GrowthMultiplier = ParseFloat(parts[7], 0.04f),
+                            GrowthConstant = ParseFloat(parts[8], 8.0f)
+                        };
+                    }
+                    else if (parts[0] == "E")
+                    {
+                        extendedRecord = line;
+                    }
                 }
-                else
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogWarning("[SLE] YAML reload returned null, keeping existing configuration");
-                    _entriesByName = _entriesByName ?? new Dictionary<string, YamlExporter.SkillYamlEntry>(StringComparer.Ordinal);
-                }
+
+                _serverEntries = parsed;
+                _isServerConfig = true;
+                SLE_ExtendedScaling.ApplyServerRecord(extendedRecord);
+
+                SkillLimitExtenderPlugin.Logger?.LogInfo(
+                    $"[SLE] Received server configuration ({_serverEntries.Count} skill sections)");
             }
             catch (Exception ex)
             {
-                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] YAML reload failed: {ex.Message}");
-                // Keep existing configuration on error to prevent null reference
-                _entriesByName = _entriesByName ?? new Dictionary<string, YamlExporter.SkillYamlEntry>(StringComparer.Ordinal);
+                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to apply server config: {ex}");
             }
         }
 
-        // Accessors
-        // Helper method to map MOD skill IDs to readable names from YAML
-        private static string GetSkillKeyForLookup(global::Skills.SkillType st)
-        {
-            string skillKey = st.ToString();
-            
-            // For MOD skills (numeric IDs > 999), try to find corresponding name in YAML
-            if (int.TryParse(skillKey, out int skillId) && skillId > 999)
-            {
-                if (_entriesByName != null)
-                {
-                    // First, check if the numeric ID itself is defined in YAML
-                    if (_entriesByName.ContainsKey(skillKey))
-                    {
-                        if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-                        {
-                            SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] Using numeric key '{skillKey}' for MOD skill");
-                        }
-                        return skillKey;
-                    }
-                    
-                    // Try to get the actual skill name from the game
-                    string actualSkillName = GetActualModSkillName(st);
-                    if (!string.IsNullOrEmpty(actualSkillName) && !string.Equals(actualSkillName, skillKey, StringComparison.Ordinal))
-                    {
-                        // Check if the actual skill name exists in YAML
-                        if (_entriesByName.ContainsKey(actualSkillName))
-                        {
-                            if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-                            {
-                                SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] Mapping MOD skill ID {skillId} to actual name '{actualSkillName}'");
-                            }
-                            return actualSkillName;
-                        }
-                        
-                        // Also try common variations of the skill name
-                        string[] nameVariations = GenerateSkillNameVariations(actualSkillName);
-                        foreach (string variation in nameVariations)
-                        {
-                            if (_entriesByName.ContainsKey(variation))
-                            {
-                                if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-                                {
-                                    SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] Mapping MOD skill ID {skillId} to variation '{variation}' (from '{actualSkillName}')");
-                                }
-                                return variation;
-                            }
-                        }
-                    }
-                    
-                    // Log warning only once per skill ID
-                    if (!_warnedSkillIds.Contains(skillId))
-                    {
-                        _warnedSkillIds.Add(skillId);
-                        var availableKeys = string.Join(", ", _entriesByName.Keys.Take(10));
-                        string suggestedKey = !string.IsNullOrEmpty(actualSkillName) && !actualSkillName.StartsWith("$") ? actualSkillName : skillKey;
-                        SkillLimitExtenderPlugin.Logger?.LogWarning($"[SLE] MOD skill ID {skillId} (name: '{actualSkillName ?? "Unknown"}') not found in YAML. Available keys: {availableKeys}... Please add '{suggestedKey}' to your YAML file.");
-                    }
-                }
-            }
-            
-            return skillKey;
-        }
-        
-        // Generate common variations of skill names for YAML lookup
-        private static string[] GenerateSkillNameVariations(string skillName)
-        {
-            if (string.IsNullOrEmpty(skillName)) return new string[0];
-            
-            var variations = new List<string>();
-            
-            // Original name
-            variations.Add(skillName);
-            
-            // Remove localization prefix if present
-            if (skillName.StartsWith("$"))
-            {
-                string withoutPrefix = skillName.Substring(1);
-                variations.Add(withoutPrefix);
-                
-                // Try common patterns for localization keys
-                if (withoutPrefix.StartsWith("skilldesc_"))
-                {
-                    variations.Add(withoutPrefix.Substring(10)); // Remove "skilldesc_"
-                }
-                if (withoutPrefix.EndsWith("Skill"))
-                {
-                    variations.Add(withoutPrefix.Substring(0, withoutPrefix.Length - 5)); // Remove "Skill"
-                }
-            }
-            
-            // Clean version (alphanumeric only)
-            string cleaned = CleanSkillNameForYaml(skillName);
-            if (!variations.Contains(cleaned))
-            {
-                variations.Add(cleaned);
-            }
-            
-            return variations.ToArray();
-        }
-        
-        // Helper method to get the actual skill name from the game
-        private static string GetActualModSkillName(global::Skills.SkillType skillType)
-        {
-            try
-            {
-                // Try to get skill name from localization or skill definition
-                var localPlayer = SLE_SkillHelpers.GetSafeLocalPlayer();
-                var skillsInstance = localPlayer?.GetSkills();
-                if (skillsInstance != null)
-                {
-                    var skillData = HarmonyLib.Traverse.Create(skillsInstance).Field("m_skillData").GetValue<System.Collections.Generic.Dictionary<global::Skills.SkillType, global::Skills.Skill>>();
-                    if (skillData != null && skillData.TryGetValue(skillType, out var skill))
-                    {
-                        var info = HarmonyLib.Traverse.Create(skill).Field("m_info").GetValue<global::Skills.SkillDef>();
-                        if (info != null)
-                        {
-                            // Try to get the skill identifier (m_skill field) first
-                            var skillIdentifier = HarmonyLib.Traverse.Create(info).Field("m_skill").GetValue<global::Skills.SkillType>();
-                            if (skillIdentifier != global::Skills.SkillType.None)
-                            {
-                                string identifierName = skillIdentifier.ToString();
-                                // If it's not a numeric ID, use the identifier name
-                                if (!int.TryParse(identifierName, out _))
-                                {
-                                    return identifierName;
-                                }
-                            }
-                            
-                            // Try to get localized name from Localization system
-                            var descriptionKey = HarmonyLib.Traverse.Create(info).Field("m_description").GetValue<string>();
-                            if (!string.IsNullOrEmpty(descriptionKey) && !descriptionKey.StartsWith("$"))
-                            {
-                                return descriptionKey;
-                            }
-                            
-                            // Try to resolve localization key to actual name
-                            if (!string.IsNullOrEmpty(descriptionKey) && descriptionKey.StartsWith("$"))
-                            {
-                                try
-                                {
-                                    string localizedName = Localization.instance?.Localize(descriptionKey);
-                                    if (!string.IsNullOrEmpty(localizedName) && localizedName != descriptionKey)
-                                    {
-                                        // Clean up the localized name for YAML compatibility
-                                        return CleanSkillNameForYaml(localizedName);
-                                    }
-                                }
-                                catch { /* ignore localization errors */ }
-                            }
-                        }
-                    }
-                }
-                
-                // Fallback: use enum name
-                return skillType.ToString();
-            }
-            catch (System.Exception ex)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogWarning($"[SLE] Failed to get actual skill name for {skillType}: {ex.Message}");
-                return skillType.ToString();
-            }
-        }
-        
-        // Helper method to clean skill names for YAML compatibility
-        private static string CleanSkillNameForYaml(string skillName)
-        {
-            if (string.IsNullOrEmpty(skillName)) return skillName;
-            
-            // Remove special characters and spaces, keep only alphanumeric and underscores
-            var cleaned = System.Text.RegularExpressions.Regex.Replace(skillName, @"[^\w]", "");
-            
-            // Ensure it starts with a letter or underscore (YAML key requirement)
-            if (cleaned.Length > 0 && char.IsDigit(cleaned[0]))
-            {
-                cleaned = "_" + cleaned;
-            }
-            
-            return string.IsNullOrEmpty(cleaned) ? skillName : cleaned;
-        }
-
-        internal static int GetCap(global::Skills.SkillType st)
-        {
-            string skillKey = GetSkillKeyForLookup(st);
-            
-            // Parse skill ID once for logging
-            bool isSkill1337 = int.TryParse(st.ToString(), out int skillId) && skillId == 1337;
-            
-            // Skill 1337 specific handling
-            if (isSkill1337)
-            {
-                var debugEntry = _entriesByName?.TryGetValue(skillKey, out var tempEntry) == true ? tempEntry : null;
-                SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] Skill 1337 - Key: '{skillKey}', Cap: {debugEntry?.Cap ?? DefaultCapFallback}");
-            }
-    
-            // Client-side: local YAML is enabled
-            if (!_isServerConfig && EnableYamlOverride?.Value == true &&
-                _entriesByName != null &&
-                _entriesByName.TryGetValue(skillKey, out var entry) &&
-                entry != null && entry.Cap > 0)
-            {
-                if (isSkill1337)
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] Skill 1337 using client cap: {entry.Cap}");
-                }
-                return entry.Cap;
-            }
-    
-            // Applying server-distributed YAML
-            if (_isServerConfig &&
-                _entriesByName != null &&
-                _entriesByName.TryGetValue(skillKey, out var serverEntry) &&
-                serverEntry != null && serverEntry.Cap > 0)
-            {
-                if (isSkill1337)
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] Skill 1337 using server cap: {serverEntry.Cap}");
-                }
-                return serverEntry.Cap;
-            }
-    
-            if (isSkill1337)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] Skill 1337 using fallback cap: {DefaultCapFallback}");
-            }
-            return DefaultCapFallback;
-        }
-
-        /// <summary>
-        /// CartographySkill専用の上限取得メソッド
-        /// </summary>
-        internal static int GetCartographySkillCap()
-        {
-            // CartographySkillのスキルタイプを取得（通常は数値ID）
-            try
-            {
-                // YAMLでCartographySkillが定義されているかチェック
-                if (_entriesByName != null)
-                {
-                    // 一般的なCartographySkillの名前でチェック
-                    string[] possibleKeys = { "Cartography", "CartographySkill", "1337" };
-                    
-                    foreach (var key in possibleKeys)
-                    {
-                        if (_entriesByName.TryGetValue(key, out var entry) && entry != null && entry.Cap > 0)
-                        {
-                            if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-                            {
-                                SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] CartographySkill cap found in YAML with key '{key}': {entry.Cap}");
-                            }
-                            return entry.Cap;
-                        }
-                    }
-                }
-                
-                if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] CartographySkill using default cap: {DefaultCapFallback}");
-                }
-                return DefaultCapFallback;
-            }
-            catch (Exception ex)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogWarning($"[SLE] Error getting CartographySkill cap: {ex.Message}");
-                return DefaultCapFallback;
-            }
-        }
-
-        internal static int GetBonusCap(global::Skills.SkillType st)
-        {
-            string skillKey = GetSkillKeyForLookup(st);
-
-            if (!_isServerConfig && EnableYamlOverride?.Value == true)
-            {
-                if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null && entry.BonusCap > 0)
-                    return entry.BonusCap;
-            }
-
-            if (_isServerConfig)
-            {
-                if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var serverEntry) && serverEntry != null && serverEntry.BonusCap > 0)
-                    return serverEntry.BonusCap;
-            }
-
-            return DefaultBonusCapFallback;
-        }
-
-        internal static bool IsRelative(global::Skills.SkillType st)
-        {
-            string skillKey = GetSkillKeyForLookup(st);
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.Relative;
-            return true; // Default to relative scaling
-        }
-
-        // Growth curve parameters
-        internal static float GetGrowthExponent(global::Skills.SkillType st)
-        {
-            string skillKey = GetSkillKeyForLookup(st);
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.GrowthExponent;
-            return 1.5f; // Vanilla default
-        }
-
-        internal static float GetGrowthMultiplier(global::Skills.SkillType st)
-        {
-            string skillKey = GetSkillKeyForLookup(st);
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.GrowthMultiplier;
-            return 0.5f; // Vanilla default
-        }
-
-        internal static float GetGrowthConstant(global::Skills.SkillType st)
-        {
-            string skillKey = GetSkillKeyForLookup(st);
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.GrowthConstant;
-            return 0.5f; // Vanilla default
-        }
-
-        internal static bool UseCustomGrowthCurve(global::Skills.SkillType st)
-        {
-            string skillKey = GetSkillKeyForLookup(st);
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.UseCustomGrowthCurve;
-            return false; // Default: use vanilla curve
-        }
-
-        // Growth curve parameters
-        internal static float GetGrowthExponent(global::Skills.SkillType st)
-        {
-            string skillKey = st.ToString();
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.GrowthExponent;
-            return 1.5f; // Vanilla default
-        }
-
-        internal static float GetGrowthMultiplier(global::Skills.SkillType st)
-        {
-            string skillKey = st.ToString();
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.GrowthMultiplier;
-            return 0.5f; // Vanilla default
-        }
-
-        internal static float GetGrowthConstant(global::Skills.SkillType st)
-        {
-            string skillKey = st.ToString();
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.GrowthConstant;
-            return 0.5f; // Vanilla default
-        }
-
-        internal static bool UseCustomGrowthCurve(global::Skills.SkillType st)
-        {
-            string skillKey = st.ToString();
-            if (_entriesByName != null && _entriesByName.TryGetValue(skillKey, out var entry) && entry != null)
-                return entry.UseCustomGrowthCurve;
-            return false; // Default: use vanilla curve
-        }
-
-        // UI denominator (global/per-skill)
-        internal static float GetFactorDenominator(global::Skills.SkillType st) => 100f; // Vanilla behavior
-        internal static float GetUiDenominator() 
-        {
-            try
-            {
-                // Always return a safe value, even if configuration is corrupted
-                var result = Math.Max(1, DefaultCapFallback);
-                if (result <= 0 || float.IsNaN(result) || float.IsInfinity(result))
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogWarning("[SLE] GetUiDenominator: Invalid result, using fallback 100f");
-                    return 100f;
-                }
-                return result;
-            }
-            catch (Exception ex)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] GetUiDenominator failed: {ex.Message}, using fallback 100f");
-                return 100f; // Safe fallback
-            }
-        }
-        internal static float GetUiDenominatorForSkill(global::Skills.SkillType st) => Math.Max(1, GetCap(st));
-
-        // Added: safe helper to obtain per-skill UI denominator
-        // Special handling: always use the same denominator for both levelbar and levelbar_total
-        internal static float GetUiDenominatorForSkillSafe(object? skillMaybe)
-        {
-            try
-            {
-                var s = skillMaybe as global::Skills.Skill;
-                if (s != null)
-                {
-                    var info = HarmonyLib.Traverse.Create(s).Field("m_info").GetValue<global::Skills.SkillDef>();
-                    if (info != null)
-                    {
-                        var st = HarmonyLib.Traverse.Create(info).Field("m_skill").GetValue<global::Skills.SkillType>();
-                        float result = GetUiDenominatorForSkill(st);
-                        if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-                        {
-                            SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] UI denominator for {st}: {result} (level={s.m_level})");
-                        }
-                        return result;
-                    }
-                }
-            }
-            catch (System.Exception e)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogWarning($"[SLE] GetUiDenominatorForSkillSafe failed: {e.Message}");
-            }
-            float fallback = GetUiDenominator();
-            if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogDebug($"[SLE] UI denominator fallback: {fallback}");
-            }
-            return fallback;
-        }
-
-        // Server → client: send full YAML
         internal static void SendConfigToClients()
         {
-            if (ZNet.instance?.IsServer() != true || !(ServerConfigLocked?.Value == true)) return;
+            if (ZNet.instance?.IsServer() != true || ServerConfigLocked?.Value != true)
+                return;
+
             try
             {
-                var yamlPath = YamlExporter.GetYamlPath();
-                string yamlContent = System.IO.File.Exists(yamlPath)
-                    ? System.IO.File.ReadAllText(yamlPath)
-                    : string.Empty;
-                int proto = VersionInfo.ProtocolVersion;
-                ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "SLE_YamlSync", yamlContent, proto);
-                _lastYamlHash = ComputeHash(yamlContent ?? string.Empty);
-                SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] Server YAML sent to clients (length={yamlContent?.Length ?? 0}, proto={proto})");
+                string snapshot = BuildSnapshot();
+                ZRoutedRpc.instance.InvokeRoutedRPC(
+                    0L,
+                    "SLE_ConfigSync",
+                    snapshot,
+                    VersionInfo.ProtocolVersion);
+
+                _lastSnapshotHash = ComputeHash(snapshot);
+                SkillLimitExtenderPlugin.Logger?.LogInfo(
+                    $"[SLE] Server configuration sent to clients ({snapshot.Length} chars)");
             }
-            catch (System.Exception e)
+            catch (Exception ex)
             {
-                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to send YAML to clients: {e}");
+                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to send server config: {ex}");
             }
         }
 
         internal static void SendConfigToClientsIfChanged()
         {
-            if (ZNet.instance?.IsServer() != true || !(ServerConfigLocked?.Value == true)) return;
+            if (ZNet.instance?.IsServer() != true || ServerConfigLocked?.Value != true)
+                return;
+
             try
             {
-                var yamlPath = YamlExporter.GetYamlPath();
-                string yamlContent = System.IO.File.Exists(yamlPath)
-                    ? System.IO.File.ReadAllText(yamlPath)
-                    : string.Empty;
-
-                string currentHash = ComputeHash(yamlContent ?? string.Empty);
-                if (string.Equals(_lastYamlHash, currentHash, System.StringComparison.Ordinal))
-                {
-                    if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
-                    {
-                        SkillLimitExtenderPlugin.Logger?.LogDebug("[SLE] YAML unchanged; broadcast skipped.");
-                    }
+                string snapshot = BuildSnapshot();
+                string hash = ComputeHash(snapshot);
+                if (string.Equals(hash, _lastSnapshotHash, StringComparison.Ordinal))
                     return;
-                }
 
-                int proto = VersionInfo.ProtocolVersion;
-                ZRoutedRpc.instance.InvokeRoutedRPC(ZRoutedRpc.Everybody, "SLE_YamlSync", yamlContent, proto);
-                _lastYamlHash = currentHash;
-                SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] Server YAML broadcasted to everybody (length={yamlContent?.Length ?? 0}, proto={proto})");
+                ZRoutedRpc.instance.InvokeRoutedRPC(
+                    0L,
+                    "SLE_ConfigSync",
+                    snapshot,
+                    VersionInfo.ProtocolVersion);
+
+                _lastSnapshotHash = hash;
+                SkillLimitExtenderPlugin.Logger?.LogInfo("[SLE] Changed server configuration broadcasted to clients");
             }
-            catch (System.Exception e)
+            catch (Exception ex)
             {
-                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to broadcast YAML: {e}");
+                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to broadcast server config: {ex}");
             }
         }
 
-        // Client: receive server YAML
-        private static void OnYamlReceived(long sender, string yamlContent, int protocolVersion)
+        private static string BuildSnapshot()
         {
-            if (ZNet.instance?.IsServer() == true) return; // Ignore on server
-            try
+            var builder = new StringBuilder();
+
+            foreach (var pair in EntriesByName.OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase))
             {
-                _isServerConfig = true;
-
-                if (!VersionInfo.IsCompatible(protocolVersion))
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogWarning($"[SLE] Protocol version mismatch: remote={protocolVersion}, local={VersionInfo.ProtocolVersion}");
-                    return; // Mismatch: do not apply YAML
-                }
-
-                if (!string.IsNullOrEmpty(yamlContent))
-                {
-                    var deserializer = new YamlDotNet.Serialization.DeserializerBuilder()
-                        .WithNamingConvention(YamlDotNet.Serialization.NamingConventions.CamelCaseNamingConvention.Instance)
-                        .IgnoreUnmatchedProperties()
-                        .Build();
-                    try
-                    {
-                        var map = deserializer.Deserialize<Dictionary<string, YamlExporter.SkillYamlEntry>>(yamlContent);
-                        _entriesByName = map ?? new Dictionary<string, YamlExporter.SkillYamlEntry>(StringComparer.Ordinal);
-                    }
-                    catch (YamlDotNet.Core.YamlException yamlEx)
-                    {
-                        SkillLimitExtenderPlugin.Logger?.LogWarning($"[SLE] YAML parsing failed, trying legacy format: {yamlEx.Message}");
-                        // Fallback to legacy format (int)
-                        var mapOld = deserializer.Deserialize<Dictionary<string, int>>(yamlContent) ?? new Dictionary<string, int>();
-                        var converted = new Dictionary<string, YamlExporter.SkillYamlEntry>(StringComparer.Ordinal);
-                        foreach (var kv in mapOld)
-                        {
-                            converted[kv.Key] = new YamlExporter.SkillYamlEntry { 
-                    Cap = kv.Value, 
-                    BonusCap = DefaultBonusCapFallback, 
-                    Relative = true,
-                    UseCustomGrowthCurve = false,
-                    GrowthExponent = 1.5f,
-                    GrowthMultiplier = 0.5f,
-                    GrowthConstant = 0.5f
-                };
-                        }
-                        _entriesByName = converted;
-                    }
-                    catch (System.Exception parseEx)
-                    {
-                        SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to parse server YAML: {parseEx}");
-                        _entriesByName = new Dictionary<string, YamlExporter.SkillYamlEntry>(StringComparer.Ordinal);
-                    }
-                }
-                else
-                {
-                    _entriesByName = new Dictionary<string, YamlExporter.SkillYamlEntry>(StringComparer.Ordinal);
-                }
-
-                SkillLimitExtenderPlugin.Logger?.LogInfo($"[SLE] Received server YAML (entries={_entriesByName.Count})");
+                SkillSettings entry = pair.Value;
+                builder.Append("S|")
+                    .Append(Encode(entry.Section)).Append('|')
+                    .Append(entry.Cap.Value).Append('|')
+                    .Append(entry.BonusCap.Value).Append('|')
+                    .Append(entry.Relative.Value ? "1" : "0").Append('|')
+                    .Append(entry.UseCustomGrowthCurve.Value ? "1" : "0").Append('|')
+                    .Append(entry.GrowthExponent.Value.ToString("R", CultureInfo.InvariantCulture)).Append('|')
+                    .Append(entry.GrowthMultiplier.Value.ToString("R", CultureInfo.InvariantCulture)).Append('|')
+                    .Append(entry.GrowthConstant.Value.ToString("R", CultureInfo.InvariantCulture))
+                    .Append('\n');
             }
-            catch (System.Exception e)
-            {
-                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to apply server YAML: {e}");
-                // Ensure we have a valid state even on error
-                _entriesByName = new Dictionary<string, YamlExporter.SkillYamlEntry>(StringComparer.Ordinal);
-            }
+
+            builder.Append(SLE_ExtendedScaling.BuildSyncRecord()).Append('\n');
+            return builder.ToString();
         }
 
-        // Send server configuration when player connects
-        internal static void OnPlayerConnected()
+        private static string Encode(string value) =>
+            Convert.ToBase64String(Encoding.UTF8.GetBytes(value ?? string.Empty));
+
+        private static string Decode(string value) =>
+            Encoding.UTF8.GetString(Convert.FromBase64String(value));
+
+        private static int ParseInt(string value, int fallback) =>
+            int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed)
+                ? parsed
+                : fallback;
+
+        private static float ParseFloat(string value, float fallback) =>
+            float.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed)
+                ? parsed
+                : fallback;
+
+        private static bool ParseBool(string value, bool fallback)
         {
-            SendConfigToClients();
+            if (value == "1") return true;
+            if (value == "0") return false;
+            return bool.TryParse(value, out bool parsed) ? parsed : fallback;
         }
 
-        // Compatibility API
-        internal static int GetCapByName(string name)
-        {
-            if (string.IsNullOrWhiteSpace(name)) return DefaultCapFallback;
-            if (Enum.TryParse<global::Skills.SkillType>(name, true, out var st) &&
-                st != global::Skills.SkillType.None &&
-                st != global::Skills.SkillType.All)
-            {
-                return GetCap(st);
-            }
-            return DefaultCapFallback;
-        }
-
-        // Compatibility API
-        internal static int GetSkillLimit(global::Skills.SkillType st) => GetCap(st);
-
-        // Moved here: hash computation method (inside class)
         private static string ComputeHash(string text)
         {
-            try
-            {
-                using (var sha = System.Security.Cryptography.SHA256.Create())
-                {
-                    var bytes = System.Text.Encoding.UTF8.GetBytes(text ?? string.Empty);
-                    var hash = sha.ComputeHash(bytes);
-                    return System.BitConverter.ToString(hash).Replace("-", "");
-                }
-            }
-            catch
-            {
-                return string.Empty;
-            }
+            using var sha = SHA256.Create();
+            byte[] hash = sha.ComputeHash(Encoding.UTF8.GetBytes(text ?? string.Empty));
+            return BitConverter.ToString(hash).Replace("-", string.Empty);
         }
     }
 }

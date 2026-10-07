@@ -1,5 +1,3 @@
-using HarmonyLib;
-
 namespace SkillLimitExtender
 {
     internal static class SLE_TerminalCommands
@@ -8,28 +6,35 @@ namespace SkillLimitExtender
         {
             try
             {
-                new Terminal.ConsoleCommand("sle_yaml_reload", "Reload SLE YAML", args =>
-                {
-                    if (ZNet.instance?.IsServer() == true)
+                new Terminal.ConsoleCommand(
+                    "sle_config_reload",
+                    "Reload Skill Limit Extender BepInEx configuration",
+                    args =>
                     {
-                        SkillConfigManager.ReloadFromYaml();      // Server: reload YAML
-                        SkillConfigManager.SendConfigToClientsIfChanged(); // Re-broadcast only if contents changed
-                        args.Context.AddString("SLE: reloaded YAML; broadcasted only if changed.");
-                    }
-                    else
+                        SkillConfigManager.ReloadFromConfig();
+
+                        if (ZNet.instance?.IsServer() == true)
+                            SkillConfigManager.SendConfigToClientsIfChanged();
+
+                        args.Context.AddString("SLE: configuration reloaded.");
+                    },
+                    isCheat: true,
+                    hideBehindDevCommands: false);
+
+                new Terminal.ConsoleCommand(
+                    "sle_config_path",
+                    "Show current Skill Limit Extender config path",
+                    args =>
                     {
-                        SkillConfigManager.ReloadFromYaml();      // Client: reload local YAML
-                        args.Context.AddString("SLE: reloaded local YAML.");
-                    }
-                }, true);
-                new Terminal.ConsoleCommand("sle_yaml_path", "Show current SLE YAML path", args =>
-                {
-                    args.Context.AddString($"SLE YAML path: {YamlExporter.GetYamlPath()}");
-                }, true);
+                        args.Context.AddString($"SLE config path: {SkillConfigManager.GetConfigPath()}");
+                    },
+                    isCheat: true,
+                    hideBehindDevCommands: false);
             }
             catch (System.Exception e)
             {
-                SkillLimitExtenderPlugin.Logger?.LogError($"[SLE] Failed to register console command: {e}");
+                SkillLimitExtenderPlugin.Logger?.LogError(
+                    $"[SLE] Failed to register console command: {e}");
             }
         }
     }

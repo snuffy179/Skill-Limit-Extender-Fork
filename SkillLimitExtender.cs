@@ -3,6 +3,7 @@ using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
 using System;
+using System.IO;
 
 namespace SkillLimitExtender
 {
@@ -24,15 +25,17 @@ namespace SkillLimitExtender
             Logger = base.Logger;
 
             // Configuration Manager settings
-            EnableGrowthCurveDebug = Config.Bind("Debug", "Enable Growth Curve Debug", false, 
+            EnableGrowthCurveDebug = Config.Bind("1 - Debug", "Enable Growth Curve Debug", false, 
                 "Enable debug logging for skill growth curve calculations");
 
             try
             {
                 Logger.LogInfo($"[SLE] {VersionInfo.VersionString}");
-                // 設定とYAML初期化
-                SkillConfigManager.Initialize(Config);
-                YamlExporter.EnsureYamlExists();
+                // Numeric prefixes force the global sections to sort before the skill sections in the generated config.
+                SkillConfigManager.InitializeServer(Config);
+                SLE_ExtendedScaling.Initialize(Config);
+                SkillConfigManager.InitializeSkills();
+                WarnAboutLegacyYaml();
 
                 // Harmonyパッチ適用
                 _harmony.PatchAll(typeof(SkillLimitExtenderPlugin).Assembly);
@@ -51,6 +54,21 @@ namespace SkillLimitExtender
             }
         }
 
+        private static void WarnAboutLegacyYaml()
+        {
+            string legacyYaml = Path.Combine(
+                Paths.ConfigPath,
+                "SkillLimitExtender",
+                "SLE_Skill_List.yaml");
+
+            if (File.Exists(legacyYaml))
+            {
+                Logger.LogWarning(
+                    $"[SLE] Legacy YAML config detected and ignored: {legacyYaml}. " +
+                    "Skill settings now live in the normal BepInEx SkillLimitExtender.cfg file.");
+            }
+        }
+
         private void Start()
         {
             // ゲーム開始後にRPC登録
@@ -58,8 +76,8 @@ namespace SkillLimitExtender
             {
                 try
                 {
-                    // サーバーYAML全文を同期
-                    ZRoutedRpc.instance.Register<string, int>("SLE_YamlSync", SkillConfigManager.OnYamlReceivedStatic);
+                    // Server-locked configuration snapshot sync.
+                    ZRoutedRpc.instance.Register<string, int>("SLE_ConfigSync", SkillConfigManager.OnConfigReceivedStatic);
                     SkillLimitExtenderPlugin.Logger?.LogInfo("[SLE] RPC registered successfully");
                 }
                 catch (Exception e)

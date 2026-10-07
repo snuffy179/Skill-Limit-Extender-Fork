@@ -13,12 +13,12 @@ $ProjectFile = Join-Path $RepoRoot "skill_Limit_Extender.csproj"
 $PluginName = "SkillLimitExtender"
 $AssemblyName = "skill_Limit_Extender.dll"
 
-# バージョン取得（SkillLimitExtender.cs の PluginVersion を優先）
-$version = "1.0.1"
-$pluginFile = Join-Path $RepoRoot "SkillLimitExtender.cs"
-if (Test-Path $pluginFile) {
-    $content = Get-Content $pluginFile -Raw
-    $m = [regex]::Match($content, 'internal const string PluginVersion\s*=\s*"([^"]+)"')
+# Read the canonical version from VersionInfo.cs.
+$version = "0.0.0"
+$versionFile = Join-Path $RepoRoot "VersionInfo.cs"
+if (Test-Path $versionFile) {
+    $content = Get-Content $versionFile -Raw
+    $m = [regex]::Match($content, 'public const string Version\s*=\s*"([^"]+)"')
     if ($m.Success) { $version = $m.Groups[1].Value }
 }
 
