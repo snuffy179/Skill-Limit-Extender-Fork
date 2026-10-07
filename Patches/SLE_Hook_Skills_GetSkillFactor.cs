@@ -14,6 +14,16 @@ namespace SkillLimitExtender
         {
             try
             {
+                // SkillType.None / All are sentinel values, not real player skills.
+                // Calling Skills.GetSkill(None) can create a bogus None entry in
+                // m_skillData, which later crashes SkillsDialog.Setup.
+                if (skillType == global::Skills.SkillType.None ||
+                    skillType == global::Skills.SkillType.All)
+                {
+                    __result = 0f;
+                    return false;
+                }
+
                 if (SLE_SkillFactorOverride.TryGet(skillType, out float overrideFactor))
                 {
                     __result = overrideFactor;

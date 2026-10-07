@@ -55,6 +55,5 @@
 
 	<PropertyGroup>
 		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-		<OutputPath>C:\Users\user\Desktop\output</OutputPath>
 	</PropertyGroup>
 </Project>

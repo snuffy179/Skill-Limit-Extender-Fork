@@ -35,6 +35,13 @@ namespace SkillLimitExtender
         {
             try
             {
+                // Remove sentinel/null runtime entries before serializing so an
+                // already-corrupted character is repaired on its next save.
+                SLE_SkillDataSanitizer.Sanitize(
+                    __instance,
+                    "save",
+                    logUnresolved: true);
+
                 var skillData = Traverse.Create(__instance)
                     .Field("m_skillData")
                     .GetValue<Dictionary<global::Skills.SkillType, global::Skills.Skill>>();

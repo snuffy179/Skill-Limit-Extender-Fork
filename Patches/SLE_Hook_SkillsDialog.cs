@@ -2,16 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.Reflection.Emit;
 using HarmonyLib;
+using UnityEngine;
 
 namespace SkillLimitExtender
 {
     /// <summary>
-    /// Keeps the vanilla SkillsDialog.Setup implementation intact, while:
-    /// 1. repairing missing Skill.m_info references before the dialog is built;
-    /// 2. replacing the vanilla UI denominator (100) with SLE's configured UI denominator.
-    ///
-    /// The transpiler deliberately changes only the existing ldc.r4 instruction in-place.
-    /// This preserves Harmony labels / exception blocks and does not change the IL stack shape.
+    /// Keeps vanilla SkillsDialog.Setup intact, but sanitizes invalid skill data
+    /// before the dialog is built and corrects presentation for raw levels above
+    /// the vanilla 100-level UI assumptions.
     /// </summary>
     [HarmonyPatch(typeof(global::SkillsDialog), nameof(global::SkillsDialog.Setup))]
     internal static class SLE_Hook_SkillsDialog_LevelBars
@@ -39,12 +37,10 @@ namespace SkillLimitExtender
                     return false;
                 }
 
-                int repaired = RepairMissingSkillInfo(skills, logUnresolved: true);
-                if (repaired > 0)
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogWarning(
-                        $"[SLE] SkillsDialog: repaired {repaired} missing skill definition reference(s) before building the UI");
-                }
+                SLE_SkillDataSanitizer.Sanitize(
+                    skills,
+                    "SkillsDialog",
+                    logUnresolved: true);
 
                 if (SkillLimitExtenderPlugin.EnableGrowthCurveDebug?.Value == true)
                 {
@@ -63,78 +59,121 @@ namespace SkillLimitExtender
         }
 
         /// <summary>
-        /// A loaded Skill normally keeps a reference to its SkillDef in m_info.
-        /// If that reference is missing, vanilla SkillsDialog.Setup dereferences it while
-        /// creating rows and can abort half-way through the list with NullReferenceException.
+        /// Valheim 1.0 has a separate blue skill-bonus display. Its vanilla UI
+        /// assumes stored levels never exceed 100 and can misinterpret an extended
+        /// raw level as a bonus. After vanilla successfully builds the rows, write
+        /// the actual stored level and bars back into the row.
         ///
-        /// Reconnect m_info from Skills.m_skills without changing level or XP data.
+        /// We preserve a genuine positive effective-level bonus when the game's
+        /// GetSkillLevel result is greater than the raw stored level. If vanilla
+        /// clamps the effective result below an extended raw level, it is not shown
+        /// as a fake blue bonus.
         /// </summary>
-        private static int RepairMissingSkillInfo(global::Skills skills, bool logUnresolved)
+        [HarmonyPostfix]
+        [HarmonyPriority(-9000)]
+        private static void Postfix(global::SkillsDialog __instance, Player player)
         {
-            var skillData = Traverse.Create(skills)
-                .Field("m_skillData")
-                .GetValue<Dictionary<global::Skills.SkillType, global::Skills.Skill>>();
-
-            if (skillData == null || skillData.Count == 0)
-                return 0;
-
-            var skillDefs = Traverse.Create(skills)
-                .Field("m_skills")
-                .GetValue<List<global::Skills.SkillDef>>();
-
-            int repaired = 0;
-
-            foreach (var pair in skillData)
+            try
             {
-                var skill = pair.Value;
-                if (skill == null)
+                if (__instance == null || player == null || __instance.m_elements == null)
+                    return;
+
+                var skills = player.GetSkills();
+                if (skills == null)
+                    return;
+
+                var skillList = skills.GetSkillList();
+                if (skillList == null)
+                    return;
+
+                int count = Math.Min(skillList.Count, __instance.m_elements.Count);
+
+                for (int i = 0; i < count; i++)
                 {
-                    if (logUnresolved)
+                    var skill = skillList[i];
+                    var row = __instance.m_elements[i];
+
+                    if (skill == null || skill.m_info == null || row == null)
+                        continue;
+
+                    var skillType = skill.m_info.m_skill;
+                    if (skillType == global::Skills.SkillType.None ||
+                        skillType == global::Skills.SkillType.All)
+                        continue;
+
+                    float rawLevel = skill.m_level;
+                    float cap = Math.Max(1f, SkillConfigManager.GetCap(skillType));
+
+                    // Vanilla's raw level text is correct below 100. Above 100,
+                    // explicitly overwrite it so the UI does not show e.g. 100+100.
+                    if (rawLevel > 100f)
                     {
-                        SkillLimitExtenderPlugin.Logger?.LogWarning(
-                            $"[SLE] SkillsDialog: skill entry {pair.Key} ({(int)pair.Key}) is null");
-                    }
-                    continue;
-                }
+                        SetChildText(row, "leveltext", Mathf.FloorToInt(rawLevel).ToString());
 
-                var currentInfo = Traverse.Create(skill)
-                    .Field("m_info")
-                    .GetValue<global::Skills.SkillDef>();
-
-                if (currentInfo != null)
-                    continue;
-
-                global::Skills.SkillDef replacement = null;
-
-                if (skillDefs != null)
-                {
-                    for (int i = 0; i < skillDefs.Count; i++)
-                    {
-                        var candidate = skillDefs[i];
-                        if (candidate != null && candidate.m_skill == pair.Key)
+                        float effectiveLevel;
+                        try
                         {
-                            replacement = candidate;
-                            break;
+                            effectiveLevel = skills.GetSkillLevel(skillType);
                         }
-                    }
-                }
+                        catch
+                        {
+                            effectiveLevel = rawLevel;
+                        }
 
-                if (replacement != null)
-                {
-                    Traverse.Create(skill)
-                        .Field("m_info")
-                        .SetValue(replacement);
-                    repaired++;
-                }
-                else if (logUnresolved)
-                {
-                    SkillLimitExtenderPlugin.Logger?.LogWarning(
-                        $"[SLE] SkillsDialog: could not resolve SkillDef for {pair.Key} ({(int)pair.Key}), " +
-                        $"level={skill.m_level:F2}, accumulator={skill.m_accumulator:F2}");
+                        float realBonus = Mathf.Max(0f, effectiveLevel - rawLevel);
+                        SetChildText(
+                            row,
+                            "bonustext",
+                            realBonus >= 1f ? $"+{Mathf.FloorToInt(realBonus)}" : string.Empty);
+
+                        // Keep the yellow/base and blue/total bars meaningful for
+                        // extended caps. If vanilla clamps GetSkillLevel below the raw
+                        // level, the total bar is never allowed to shrink below base.
+                        SetChildBar(row, "currentlevel", Mathf.Clamp01(rawLevel / cap));
+                        SetChildBar(row, "levelbar_total", Mathf.Clamp01(Mathf.Max(rawLevel, effectiveLevel) / cap));
+                    }
                 }
             }
+            catch (Exception ex)
+            {
+                SkillLimitExtenderPlugin.Logger?.LogWarning(
+                    $"[SLE] SkillsDialog extended-level presentation fix failed: {ex.Message}");
+            }
+        }
 
-            return repaired;
+        private static void SetChildText(GameObject row, string childName, string value)
+        {
+            var child = Utils.FindChild(row.transform, childName, (IterativeSearchType)0);
+            if (child == null)
+                return;
+
+            // Avoid a hard compile-time dependency on Unity.TextMeshPro.dll.
+            var components = child.GetComponents<Component>();
+            for (int i = 0; i < components.Length; i++)
+            {
+                var component = components[i];
+                if (component == null)
+                    continue;
+
+                var type = component.GetType();
+                var property = AccessTools.Property(type, "text");
+                if (property == null || !property.CanWrite || property.PropertyType != typeof(string))
+                    continue;
+
+                property.SetValue(component, value, null);
+                return;
+            }
+        }
+
+        private static void SetChildBar(GameObject row, string childName, float value)
+        {
+            var child = Utils.FindChild(row.transform, childName, (IterativeSearchType)0);
+            if (child == null)
+                return;
+
+            var bar = child.GetComponent<GuiBar>();
+            if (bar != null)
+                bar.SetValue(value);
         }
 
         [HarmonyTranspiler]
@@ -168,7 +207,6 @@ namespace SkillLimitExtender
                     continue;
                 }
 
-                // Only touch the two divisions that feed UI SetValue calls.
                 bool feedsSetValue = false;
                 for (int j = i + 1; j < Math.Min(codes.Count, i + 12); j++)
                 {
@@ -183,8 +221,6 @@ namespace SkillLimitExtender
                 if (!feedsSetValue)
                     continue;
 
-                // Mutate the existing CodeInstruction instead of replacing/inserting it.
-                // This preserves labels and exception-block metadata exactly.
                 instruction.opcode = OpCodes.Call;
                 instruction.operand = getUiDenominator;
                 replacementCount++;
@@ -208,7 +244,12 @@ namespace SkillLimitExtender
 
                 var skills = player?.GetSkills();
                 if (skills != null)
-                    RepairMissingSkillInfo(skills, logUnresolved: true);
+                {
+                    SLE_SkillDataSanitizer.Sanitize(
+                        skills,
+                        "SkillsDialog-finalizer",
+                        logUnresolved: true);
+                }
             }
             catch (Exception diagnosticEx)
             {
@@ -216,8 +257,6 @@ namespace SkillLimitExtender
                     $"[SLE] SkillsDialog diagnostics failed: {diagnosticEx.Message}");
             }
 
-            // Do not swallow the exception. If another UI incompatibility remains,
-            // keep Unity's normal stack trace so it can be diagnosed correctly.
             return __exception;
         }
     }

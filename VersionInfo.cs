@@ -8,7 +8,7 @@ namespace SkillLimitExtender
     internal static class VersionInfo
     {
         // Semantic version (user-defined)
-        public const string Version = "1.3.3";
+        public const string Version = "1.3.4";
         public const string Prerelease = ""; // Release build
         public const string Build = "20261007";
 
@@ -16,8 +16,8 @@ namespace SkillLimitExtender
         public const bool IsDevelopmentVersion = false;
 
         // Full version string (constants)
-        public const string FullVersion = "1.3.3";
-        public const string FullVersionWithBuild = "1.3.3.0";
+        public const string FullVersion = "1.3.4";
+        public const string FullVersionWithBuild = "1.3.4.0";
 
         // Compatibility for config/RPC (kept as int; RPC exchanges int)
         public const int ProtocolVersion = 6;

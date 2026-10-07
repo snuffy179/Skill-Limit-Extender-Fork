@@ -20,6 +20,12 @@ namespace SkillLimitExtender
         {
             if (skills == null) return null;
 
+            // Never pass sentinel skill types into the game's private GetSkill.
+            // GetSkill(None) may create an invalid cached entry in m_skillData.
+            if (st == global::Skills.SkillType.None ||
+                st == global::Skills.SkillType.All)
+                return null;
+
             // 1) Invoke private GetSkill(skillType) via reflection
             if (_miGetSkill != null)
             {

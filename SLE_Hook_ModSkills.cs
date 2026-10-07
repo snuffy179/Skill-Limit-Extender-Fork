@@ -283,7 +283,7 @@ namespace SkillLimitExtender
             }
             catch
             {
-                return 250; // フォールバック
+                return SkillConfigManager.DefaultCapFallback; // Fallback to the configured fork default
             }
         }
     }

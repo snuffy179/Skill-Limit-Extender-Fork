@@ -21,6 +21,7 @@ namespace SkillLimitExtender
                     isCheat: true,
                     hideBehindDevCommands: false);
 
+
                 new Terminal.ConsoleCommand(
                     "sle_config_path",
                     "Show current Skill Limit Extender config path",
